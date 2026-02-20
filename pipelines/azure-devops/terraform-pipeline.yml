@@ -1,0 +1,119 @@
+trigger:
+  branches:
+    include:
+      - main
+      - release/*
+  paths:
+    include:
+      - terraform/**
+      - helm/**
+
+variables:
+  - group: aks-platform-prod
+  - name: TF_VERSION
+    value: '1.5.7'
+  - name: ENVIRONMENT
+    value: 'prod'
+
+stages:
+  - stage: Validate
+    displayName: 'Validate & Security Scan'
+    jobs:
+      - job: TerraformValidate
+        displayName: 'Terraform Validate'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - script: |
+              cd terraform/environments/$(ENVIRONMENT)
+              terraform init -backend=false
+              terraform validate
+              terraform fmt -check -recursive
+            displayName: 'Terraform Init & Validate'
+
+          - script: |
+              docker run --rm -v $(pwd):/src aquasec/trivy:latest \
+                config --severity HIGH,CRITICAL /src/terraform
+            displayName: 'Trivy IaC Security Scan'
+
+          - script: |
+              pip install checkov
+              checkov -d terraform/ --framework terraform \
+                --skip-check CKV_AZURE_131
+            displayName: 'Checkov Policy Check'
+
+  - stage: Plan
+    displayName: 'Terraform Plan'
+    dependsOn: Validate
+    jobs:
+      - job: TerraformPlan
+        displayName: 'Plan Infrastructure Changes'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: 'sc-aks-platform-prod'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd terraform/environments/$(ENVIRONMENT)
+                terraform init
+                terraform plan -out=tfplan -detailed-exitcode
+            displayName: 'Terraform Plan'
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: 'terraform/environments/$(ENVIRONMENT)/tfplan'
+              artifact: 'tfplan'
+
+  - stage: Apply
+    displayName: 'Terraform Apply'
+    dependsOn: Plan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: TerraformApply
+        displayName: 'Apply Infrastructure Changes'
+        environment: 'aks-platform-prod'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    artifact: 'tfplan'
+                    path: 'terraform/environments/$(ENVIRONMENT)'
+
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: 'sc-aks-platform-prod'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      cd terraform/environments/$(ENVIRONMENT)
+                      terraform init
+                      terraform apply tfplan
+                  displayName: 'Terraform Apply'
+
+                - script: |
+                    az aks get-credentials \
+                      --resource-group rg-aks-platform-prod \
+                      --name aks-platform-prod \
+                      --overwrite-existing
+                    kubectl get nodes
+                    kubectl get pods -A
+                  displayName: 'Smoke Test - Cluster Health'
